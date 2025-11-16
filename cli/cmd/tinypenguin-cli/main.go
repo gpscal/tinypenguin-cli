@@ -4,17 +4,47 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"os"
 
+	"github.com/joho/godotenv"
 	"example.com/tinypenguin/pkg/cli"
 )
 
+// getDefaultModel returns the default model from environment or fallback
+func getDefaultModel() string {
+	if model := os.Getenv("MODEL"); model != "" {
+		return model
+	}
+	return "qwen2.5-coder:3b"
+}
+
+// getDefaultURL returns the default URL from environment or fallback
+func getDefaultURL() string {
+	if url := os.Getenv("TINYLLAMA_URL"); url != "" {
+		return url
+	}
+	return "http://localhost:11434/v1"
+}
+
 var (
-	tinyllamaURL = flag.String("url", "http://localhost:11434/v1", "API URL (Ollama compatible)")
-	model        = flag.String("model", "qwen2.5-coder:3b", "Model name to use")
-	taskID       = flag.String("task-id", "", "Task ID for cancel/list operations")
-	toolsEnabled = flag.Bool("tools", true, "Enable tool calling (default: true)")
-	debugMode    = flag.Bool("debug", false, "Enable debug output to diagnose tool calling issues")
+	tinyllamaURL *string
+	model        *string
+	taskID       *string
+	toolsEnabled *bool
+	debugMode    *bool
 )
+
+func init() {
+	// Load .env file if it exists (ignore errors if file doesn't exist)
+	_ = godotenv.Load()
+	
+	// Initialize flags with defaults from environment variables
+	tinyllamaURL = flag.String("url", getDefaultURL(), "API URL (Ollama compatible)")
+	model = flag.String("model", getDefaultModel(), "Model name to use")
+	taskID = flag.String("task-id", "", "Task ID for cancel/list operations")
+	toolsEnabled = flag.Bool("tools", true, "Enable tool calling (default: true)")
+	debugMode = flag.Bool("debug", false, "Enable debug output to diagnose tool calling issues")
+}
 
 func main() {
 	flag.Parse()

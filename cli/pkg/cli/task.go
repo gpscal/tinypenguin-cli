@@ -45,18 +45,20 @@ type TaskResponse struct {
 	Output  string `json:"output,omitempty"`
 }
 
-// ToolCallLog represents a log entry for tool call usage
+// ToolCallLog represents a log entry for tool call usage with full conversation context
 type ToolCallLog struct {
 	Timestamp        time.Time `json:"timestamp"`
-	Model           string    `json:"model"`
-	ToolName        string    `json:"tool_name"`
-	Arguments       string    `json:"arguments"`
-	Status          string    `json:"status"`
-	Message         string    `json:"message"`
-	Output          string    `json:"output,omitempty"`
-	ErrorDetails    string    `json:"error_details,omitempty"`
-	ToolsEnabled    bool      `json:"tools_enabled"`
-	Rating          int       `json:"rating,omitempty"` // 1-5 stars for training data
+	Model            string    `json:"model"`
+	UserQuery        string    `json:"user_query"`        // Original user query
+	ModelResponse    string    `json:"model_response"`   // Full model response (with tool calls)
+	ToolName         string    `json:"tool_name"`
+	Arguments        string    `json:"arguments"`
+	Status           string    `json:"status"`
+	Message          string    `json:"message"`
+	Output           string    `json:"output,omitempty"`
+	ErrorDetails     string    `json:"error_details,omitempty"`
+	ToolsEnabled     bool      `json:"tools_enabled"`
+	Rating           int       `json:"rating,omitempty"` // 1-5 stars for training data
 }
 
 // getLogPath returns the fixed path for the tool_calls.log file
@@ -95,8 +97,9 @@ func getLogPath() string {
 }
 
 // logToolCall appends a tool call log entry to the tool_calls.log file
+// This function now stores full conversation context for fine-tuning
 func logToolCall(logEntry ToolCallLog) {
-	const maxEntries = 1000
+	const maxEntries = 10000
 	logPath := getLogPath()
 
 	var existingLogs []ToolCallLog
@@ -136,10 +139,20 @@ func logToolCall(logEntry ToolCallLog) {
 
 func RunTask(query string, tinyllamaURL string, model string, toolsEnabled, debugMode bool) error {
 	if tinyllamaURL == "" {
-		tinyllamaURL = "http://localhost:11434/v1"
+		// Check environment variable first
+		if envURL := os.Getenv("TINYLLAMA_URL"); envURL != "" {
+			tinyllamaURL = envURL
+		} else {
+			tinyllamaURL = "http://localhost:11434/v1"
+		}
 	}
 	if model == "" {
-		model = "qwen2.5-coder:3b"
+		// Check environment variable first
+		if envModel := os.Getenv("MODEL"); envModel != "" {
+			model = envModel
+		} else {
+			model = "qwen2.5-coder:3b"
+		}
 	}
 	manager := NewTaskManager(tinyllamaURL, model, toolsEnabled, debugMode)
 	return manager.ExecuteTask(context.Background(), query)
@@ -194,7 +207,7 @@ Your response should have a "tool_calls" array with this structure:
 WRONG FORMAT (what you MUST NOT do):
 DO NOT put this in your content/text:
 {
-  "content": "```json\n{\"command\": \"who\"}\n```"
+  "content": "` + "```json\\n{\\\"command\\\": \\\"who\\\"}\\n```" + `"
 }
 
 DO NOT put this in your content/text:
@@ -355,6 +368,27 @@ Available tools:
 		}
 	}
 	
+	// Try to extract tool calls from content if they're not in proper format
+	// This handles cases where models return tool calls as JSON in content field
+	if len(message.ToolCalls) == 0 && message.Content != "" {
+		if tm.debugMode {
+			fmt.Printf("🐛 DEBUG - Attempting to extract tool calls from content\n")
+		}
+		extractedToolCalls := tm.extractToolCallsFromContent(message.Content)
+		if len(extractedToolCalls) > 0 {
+			if tm.debugMode {
+				fmt.Printf("🐛 DEBUG - Extracted %d tool call(s) from content\n", len(extractedToolCalls))
+			}
+			message.ToolCalls = extractedToolCalls
+		} else if tm.debugMode {
+			fmt.Printf("🐛 DEBUG - No tool calls extracted from content\n")
+		}
+	}
+	
+	// Serialize model response for logging
+	modelResponseJSON, _ := json.Marshal(message)
+	modelResponseStr := string(modelResponseJSON)
+
 	// Check if the model wants to use tools
 	if len(message.ToolCalls) > 0 {
 		fmt.Printf("🔧 Model wants to use %d tool(s)\n", len(message.ToolCalls))
@@ -387,17 +421,19 @@ Available tools:
 				fmt.Printf("⭐ Rating saved: %d/5 stars\n", rating)
 			}
 
-			// Log the tool call for training
+			// Log the tool call for training with full conversation context
 			logEntry := ToolCallLog{
 				Timestamp:     time.Now(),
-				Model:        tm.model,
-				ToolName:     toolCall.Function.Name,
-				Arguments:    toolCall.Function.Arguments,
-				Status:       toolResult.Status,
-				Message:      toolResult.Message,
-				Output:       toolResult.Output,
-				ToolsEnabled: tm.toolsEnabled,
-				Rating:       rating,
+				Model:         tm.model,
+				UserQuery:     query, // Store original user query
+				ModelResponse: modelResponseStr, // Store full model response
+				ToolName:      toolCall.Function.Name,
+				Arguments:     toolCall.Function.Arguments,
+				Status:        toolResult.Status,
+				Message:       toolResult.Message,
+				Output:        toolResult.Output,
+				ToolsEnabled:  tm.toolsEnabled,
+				Rating:        rating,
 				ErrorDetails: func() string {
 					if toolResult.Status == "error" {
 						return toolResult.Message
@@ -446,16 +482,22 @@ Available tools:
 			}
 
 			// Log the tool call for training (fallback path - malformed tool call)
+			// Serialize model response for logging
+			fallbackModelResponseJSON, _ := json.Marshal(message)
+			fallbackModelResponseStr := string(fallbackModelResponseJSON)
+			
 			logEntry := ToolCallLog{
 				Timestamp:     time.Now(),
-				Model:        tm.model,
-				ToolName:     "run_commands",
-				Arguments:    string(cmdJSON),
-				Status:       toolResult.Status,
-				Message:      toolResult.Message,
-				Output:       toolResult.Output,
-				ToolsEnabled: tm.toolsEnabled,
-				Rating:       rating,
+				Model:         tm.model,
+				UserQuery:     query, // Store original user query
+				ModelResponse: fallbackModelResponseStr, // Store full model response
+				ToolName:      "run_commands",
+				Arguments:     string(cmdJSON),
+				Status:        toolResult.Status,
+				Message:       toolResult.Message,
+				Output:        toolResult.Output,
+				ToolsEnabled:  tm.toolsEnabled,
+				Rating:        rating,
 				ErrorDetails: func() string {
 					if toolResult.Status == "error" {
 						return toolResult.Message
@@ -621,6 +663,250 @@ func getCurrentDirectory() string {
 		return "/unknown"
 	}
 	return wd
+}
+
+// extractToolCallsFromContent attempts to extract tool calls from JSON in content field
+// This handles cases where models return tool calls as JSON instead of proper tool_calls format
+func (tm *TaskManager) extractToolCallsFromContent(content string) []common.ToolCall {
+	if content == "" {
+		return nil
+	}
+	
+	originalContent := content
+	
+	// Strip markdown code blocks if present
+	content = strings.TrimSpace(content)
+	if strings.HasPrefix(content, "```") {
+		lines := strings.Split(content, "\n")
+		if len(lines) > 0 {
+			firstLine := strings.TrimSpace(lines[0])
+			if strings.HasPrefix(firstLine, "```") {
+				lines = lines[1:]
+			}
+		}
+		if len(lines) > 0 {
+			lastLine := strings.TrimSpace(lines[len(lines)-1])
+			if lastLine == "```" {
+				lines = lines[:len(lines)-1]
+			}
+		}
+		content = strings.TrimSpace(strings.Join(lines, "\n"))
+	}
+	
+	if tm.debugMode {
+		fmt.Printf("🐛 DEBUG - extractToolCallsFromContent: original=%q, after markdown strip=%q\n", originalContent, content)
+	}
+	
+	// Try to parse as JSON
+	var jsonContent map[string]interface{}
+	var jsonErr error
+	if jsonErr = json.Unmarshal([]byte(content), &jsonContent); jsonErr != nil {
+		if tm.debugMode {
+			fmt.Printf("🐛 DEBUG - JSON parse error: %v\n", jsonErr)
+		}
+		// If parsing failed, try to find JSON object in the content
+		startIdx := strings.Index(content, "{")
+		endIdx := strings.LastIndex(content, "}")
+		if startIdx >= 0 && endIdx > startIdx {
+			jsonStr := content[startIdx : endIdx+1]
+			if tm.debugMode {
+				fmt.Printf("🐛 DEBUG - Trying to parse extracted JSON: %q\n", jsonStr)
+			}
+			jsonErr = json.Unmarshal([]byte(jsonStr), &jsonContent)
+			if jsonErr == nil {
+				content = jsonStr
+			} else if tm.debugMode {
+				fmt.Printf("🐛 DEBUG - Extracted JSON parse error: %v\n", jsonErr)
+			}
+		}
+	}
+	
+	if jsonErr != nil {
+		if tm.debugMode {
+			fmt.Printf("🐛 DEBUG - Failed to parse JSON, returning nil\n")
+		}
+		return nil
+	}
+	
+	if tm.debugMode {
+		fmt.Printf("🐛 DEBUG - Successfully parsed JSON: %+v\n", jsonContent)
+	}
+	
+	var toolCalls []common.ToolCall
+	
+	// Format 1: Single tool call: {"name": "run_commands", "arguments": {"command": "ls"}}
+	if name, ok := jsonContent["name"].(string); ok {
+		if tm.debugMode {
+			fmt.Printf("🐛 DEBUG - Found name field: %q\n", name)
+		}
+		if name == "run_commands" || name == "edit_files" {
+			var argsJSON string
+			
+			// Handle arguments as object
+			if argsObj, ok := jsonContent["arguments"].(map[string]interface{}); ok {
+				if tm.debugMode {
+					fmt.Printf("🐛 DEBUG - Arguments is object: %+v\n", argsObj)
+				}
+				argsBytes, err := json.Marshal(argsObj)
+				if err == nil {
+					argsJSON = string(argsBytes)
+					if tm.debugMode {
+						fmt.Printf("🐛 DEBUG - Marshaled arguments to JSON string: %q\n", argsJSON)
+					}
+				} else if tm.debugMode {
+					fmt.Printf("🐛 DEBUG - Failed to marshal arguments: %v\n", err)
+				}
+			} else if argsStr, ok := jsonContent["arguments"].(string); ok {
+				// Handle arguments as string (already JSON)
+				argsJSON = argsStr
+				if tm.debugMode {
+					fmt.Printf("🐛 DEBUG - Arguments is string: %q\n", argsJSON)
+				}
+			} else if tm.debugMode {
+				fmt.Printf("🐛 DEBUG - Arguments field not found or wrong type\n")
+			}
+			
+			if argsJSON != "" {
+				toolCall := common.ToolCall{
+					ID:   fmt.Sprintf("call_%d", time.Now().UnixNano()),
+					Type: "function",
+					Function: common.FunctionCall{
+						Name:      name,
+						Arguments: argsJSON,
+					},
+				}
+				toolCalls = append(toolCalls, toolCall)
+				if tm.debugMode {
+					fmt.Printf("🐛 DEBUG - Created tool call: name=%q, args=%q\n", name, argsJSON)
+				}
+			} else if tm.debugMode {
+				fmt.Printf("🐛 DEBUG - argsJSON is empty, not creating tool call\n")
+			}
+		} else if tm.debugMode {
+			fmt.Printf("🐛 DEBUG - Name %q is not run_commands or edit_files\n", name)
+		}
+	} else if tm.debugMode {
+		fmt.Printf("🐛 DEBUG - No 'name' field found in JSON\n")
+	}
+	
+	// Format 2: Array of tool calls with nested structure: {"tool_calls": [{"id": "...", "type": "function", "function": {"name": "...", "arguments": "..."}}]}
+	if toolCallsArray, ok := jsonContent["tool_calls"].([]interface{}); ok {
+		if tm.debugMode {
+			fmt.Printf("🐛 DEBUG - Found tool_calls array with %d items\n", len(toolCallsArray))
+		}
+		for i, tcItem := range toolCallsArray {
+			if tcMap, ok := tcItem.(map[string]interface{}); ok {
+				// Try nested structure first: {"function": {"name": "...", "arguments": "..."}}
+				if funcMap, ok := tcMap["function"].(map[string]interface{}); ok {
+					if name, ok := funcMap["name"].(string); ok {
+						var argsJSON string
+						if argsStr, ok := funcMap["arguments"].(string); ok {
+							argsJSON = argsStr
+						} else if argsObj, ok := funcMap["arguments"].(map[string]interface{}); ok {
+							argsBytes, err := json.Marshal(argsObj)
+							if err == nil {
+								argsJSON = string(argsBytes)
+							}
+						}
+						
+						if argsJSON != "" {
+							var id string
+							if idStr, ok := tcMap["id"].(string); ok {
+								id = idStr
+							} else {
+								id = fmt.Sprintf("call_%d_%d", time.Now().UnixNano(), i)
+							}
+							
+							toolCall := common.ToolCall{
+								ID:   id,
+								Type: "function",
+								Function: common.FunctionCall{
+									Name:      name,
+									Arguments: argsJSON,
+								},
+							}
+							toolCalls = append(toolCalls, toolCall)
+							if tm.debugMode {
+								fmt.Printf("🐛 DEBUG - Created tool call from nested structure: name=%q, args=%q\n", name, argsJSON)
+							}
+						}
+					}
+				} else if name, ok := tcMap["name"].(string); ok {
+					// Try flat structure: {"name": "...", "arguments": {...}}
+					var argsJSON string
+					if argsObj, ok := tcMap["arguments"].(map[string]interface{}); ok {
+						argsBytes, err := json.Marshal(argsObj)
+						if err == nil {
+							argsJSON = string(argsBytes)
+						}
+					} else if argsStr, ok := tcMap["arguments"].(string); ok {
+						argsJSON = argsStr
+					}
+					
+					if argsJSON != "" {
+						var id string
+						if idStr, ok := tcMap["id"].(string); ok {
+							id = idStr
+						} else {
+							id = fmt.Sprintf("call_%d_%d", time.Now().UnixNano(), i)
+						}
+						
+						toolCall := common.ToolCall{
+							ID:   id,
+							Type: "function",
+							Function: common.FunctionCall{
+								Name:      name,
+								Arguments: argsJSON,
+							},
+						}
+						toolCalls = append(toolCalls, toolCall)
+						if tm.debugMode {
+							fmt.Printf("🐛 DEBUG - Created tool call from flat structure: name=%q, args=%q\n", name, argsJSON)
+						}
+					}
+				}
+			}
+		}
+	}
+	
+	// Format 3: Direct array: [{"name": "run_commands", "arguments": {...}}]
+	if len(toolCalls) == 0 {
+		var arrayContent []interface{}
+		if err := json.Unmarshal([]byte(content), &arrayContent); err == nil {
+			for i, item := range arrayContent {
+				if tcMap, ok := item.(map[string]interface{}); ok {
+					if name, ok := tcMap["name"].(string); ok {
+						var argsJSON string
+						if argsObj, ok := tcMap["arguments"].(map[string]interface{}); ok {
+							argsBytes, err := json.Marshal(argsObj)
+							if err == nil {
+								argsJSON = string(argsBytes)
+							}
+						} else if argsStr, ok := tcMap["arguments"].(string); ok {
+							argsJSON = argsStr
+						}
+						
+						if argsJSON != "" {
+							toolCall := common.ToolCall{
+								ID:   fmt.Sprintf("call_%d_%d", time.Now().UnixNano(), i),
+								Type: "function",
+								Function: common.FunctionCall{
+									Name:      name,
+									Arguments: argsJSON,
+								},
+							}
+							toolCalls = append(toolCalls, toolCall)
+						}
+					}
+				}
+			}
+		}
+	}
+	
+	if tm.debugMode {
+		fmt.Printf("🐛 DEBUG - extractToolCallsFromContent returning %d tool call(s)\n", len(toolCalls))
+	}
+	return toolCalls
 }
 
 // parseCommandFromResponse attempts to extract a command from the model's response
